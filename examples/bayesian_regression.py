@@ -1,15 +1,15 @@
-import numpy as np
 import argparse
+
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn.functional import normalize  # noqa: F401
 
-from torch.autograd import Variable
-
 import pyro
-from pyro.distributions import Normal, Bernoulli  # noqa: F401
-from pyro.infer import SVI
+from pyro.distributions import Bernoulli, Normal  # noqa: F401
+from pyro.infer import SVI, JitTrace_ELBO, Trace_ELBO
 from pyro.optim import Adam
+
 
 """
 Bayesian Regression
@@ -19,13 +19,18 @@ Learning a function of the form:
 
 
 # generate toy dataset
-def build_linear_dataset(N, p, noise_std=0.1):
-    X = np.linspace(-6, 6, num=N)
-    y = 3 * X + 1 + np.random.normal(0, noise_std, size=N)
-    X = X.reshape((N, p))
-    y = y.reshape((N, 1))
-    X, y = Variable(torch.Tensor(X)), Variable(torch.Tensor(y))
-    return torch.cat((X, y), 1)
+def build_linear_dataset(N, p, noise_std=0.01):
+    X = np.random.rand(N, p)
+    # use random integer weights from [0, 7]
+    w = np.random.randint(4, size=p)
+    print('w = {}'.format(w))
+    # set b = 1
+    y = np.matmul(X, w) + np.repeat(1, N) + np.random.normal(0, noise_std, size=N)
+    y = y.reshape(N, 1)
+    X, y = torch.tensor(X), torch.tensor(y)
+    data = torch.cat((X, y), 1)
+    assert data.shape == (N, p + 1)
+    return data
 
 
 # NN with one linear layer
@@ -40,7 +45,7 @@ class RegressionModel(nn.Module):
 
 
 N = 100  # size of toy data
-p = 1  # number of features
+p = 2  # number of features
 
 softplus = nn.Softplus()
 regression_model = RegressionModel(p)
@@ -48,49 +53,46 @@ regression_model = RegressionModel(p)
 
 def model(data):
     # Create unit normal priors over the parameters
-    mu = Variable(torch.zeros(p, 1)).type_as(data)
-    sigma = Variable(torch.ones(p, 1)).type_as(data)
-    bias_mu = Variable(torch.zeros(1)).type_as(data)
-    bias_sigma = Variable(torch.ones(1)).type_as(data)
-    w_prior, b_prior = Normal(mu, sigma), Normal(bias_mu, bias_sigma)
+    options = dict(dtype=data.dtype, device=data.device)
+    loc = torch.zeros(1, p, **options)
+    scale = 2 * torch.ones(1, p, **options)
+    bias_loc = torch.zeros(1, **options)
+    bias_scale = 2 * torch.ones(1, **options)
+    w_prior = Normal(loc, scale).to_event(1)
+    b_prior = Normal(bias_loc, bias_scale).to_event(1)
     priors = {'linear.weight': w_prior, 'linear.bias': b_prior}
-    # wrap regression model that lifts module parameters to random variables
-    # sampled from the priors
+    # lift module parameters to random variables sampled from the priors
     lifted_module = pyro.random_module("module", regression_model, priors)
-    # sample a nn
-    lifted_nn = lifted_module()
+    # sample a regressor (which also samples w and b)
+    lifted_reg_model = lifted_module()
 
-    with pyro.iarange("map", N, subsample=data):
+    with pyro.plate("map", N, subsample=data):
         x_data = data[:, :-1]
         y_data = data[:, -1]
-        # run the nn with the data
-        latent = lifted_nn(x_data).squeeze()
-        pyro.observe("obs", Normal(latent, Variable(torch.ones(data.size(0))).type_as(data)), y_data.squeeze())
+        # run the regressor forward conditioned on inputs
+        prediction_mean = lifted_reg_model(x_data).squeeze(-1)
+        pyro.sample("obs", Normal(prediction_mean, 1),
+                    obs=y_data)
 
 
 def guide(data):
-    w_mu = Variable(torch.randn(p, 1).type_as(data.data), requires_grad=True)
-    w_log_sig = Variable((-3.0 * torch.ones(p, 1) + 0.05 * torch.randn(p, 1)).type_as(data.data), requires_grad=True)
-    b_mu = Variable(torch.randn(1).type_as(data.data), requires_grad=True)
-    b_log_sig = Variable((-3.0 * torch.ones(1) + 0.05 * torch.randn(1)).type_as(data.data), requires_grad=True)
+    w_loc = torch.randn(1, p, dtype=data.dtype, device=data.device)
+    w_log_sig = -3 + 0.05 * torch.randn(1, p, dtype=data.dtype, device=data.device)
+    b_loc = torch.randn(1, dtype=data.dtype, device=data.device)
+    b_log_sig = -3 + 0.05 * torch.randn(1, dtype=data.dtype, device=data.device)
     # register learnable params in the param store
-    mw_param = pyro.param("guide_mean_weight", w_mu)
-    sw_param = softplus(pyro.param("guide_log_sigma_weight", w_log_sig))
-    mb_param = pyro.param("guide_mean_bias", b_mu)
-    sb_param = softplus(pyro.param("guide_log_sigma_bias", b_log_sig))
-    # gaussian priors for w and b
-    w_prior = Normal(mw_param, sw_param)
-    b_prior = Normal(mb_param, sb_param)
-    priors = {'linear.weight': w_prior, 'linear.bias': b_prior}
-    # overloading the parameters in the module with random samples from the prior
-    lifted_module = pyro.random_module("module", regression_model, priors)
-    # sample a nn
-    lifted_module()
-
-
-# instantiate optim and inference objects
-optim = Adam({"lr": 0.01})
-svi = SVI(model, guide, optim, loss="ELBO")
+    mw_param = pyro.param("guide_mean_weight", w_loc)
+    sw_param = softplus(pyro.param("guide_log_scale_weight", w_log_sig))
+    mb_param = pyro.param("guide_mean_bias", b_loc)
+    sb_param = softplus(pyro.param("guide_log_scale_bias", b_log_sig))
+    # gaussian guide distributions for w and b
+    w_dist = Normal(mw_param, sw_param).to_event(1)
+    b_dist = Normal(mb_param, sb_param).to_event(1)
+    dists = {'linear.weight': w_dist, 'linear.bias': b_dist}
+    # overloading the parameters in the module with random samples from the guide distributions
+    lifted_module = pyro.random_module("module", regression_model, dists)
+    # sample a regressor
+    return lifted_module()
 
 
 # get array of batch indices
@@ -101,18 +103,19 @@ def get_batch_indices(N, batch_size):
     return all_batches
 
 
-def main():
-    parser = argparse.ArgumentParser(description="parse args")
-    parser.add_argument('-n', '--num-epochs', default=1000, type=int)
-    parser.add_argument('-b', '--batch-size', default=N, type=int)
-    parser.add_argument('--cuda', action='store_true')
-    args = parser.parse_args()
+def main(args):
+    pyro.clear_param_store()
     data = build_linear_dataset(N, p)
     if args.cuda:
         # make tensors and modules CUDA
         data = data.cuda()
         softplus.cuda()
         regression_model.cuda()
+
+    # perform inference
+    optim = Adam({"lr": 0.05})
+    elbo = JitTrace_ELBO() if args.jit else Trace_ELBO()
+    svi = SVI(model, guide, optim, loss=elbo)
     for j in range(args.num_epochs):
         if args.batch_size == N:
             # use the entire data set
@@ -134,4 +137,11 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    assert pyro.__version__.startswith('0.3.3')
+    parser = argparse.ArgumentParser(description="parse args")
+    parser.add_argument('-n', '--num-epochs', default=1000, type=int)
+    parser.add_argument('-b', '--batch-size', default=N, type=int)
+    parser.add_argument('--cuda', action='store_true')
+    parser.add_argument('--jit', action='store_true')
+    args = parser.parse_args()
+    main(args)

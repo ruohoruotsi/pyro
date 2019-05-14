@@ -1,182 +1,226 @@
 from __future__ import absolute_import, division, print_function
 
+import numbers
+from contextlib import contextmanager
+
 import torch
-import torch.nn.functional as F
-from torch.autograd import Variable
+import torch.distributions as torch_dist
+from torch import logsumexp
+from torch.distributions.utils import broadcast_all
+
+from pyro.util import ignore_jit_warnings
+
+_VALIDATION_ENABLED = False
+
+log_sum_exp = logsumexp  # DEPRECATED
 
 
-def log_gamma(xx):
-    if isinstance(xx, Variable):
-        ttype = xx.data.type()
-    elif isinstance(xx, torch.Tensor):
-        ttype = xx.type()
-    gamma_coeff = [
-        76.18009172947146,
-        -86.50532032941677,
-        24.01409824083091,
-        -1.231739572450155,
-        0.1208650973866179e-2,
-        -0.5395239384953e-5,
-    ]
-    magic1 = 1.000000000190015
-    magic2 = 2.5066282746310005
-    x = xx - 1.0
-    t = x + 5.5
-    t = t - (x + 0.5) * torch.log(t)
-    ser = Variable(torch.ones(x.size()).type(ttype)) * magic1
-    for c in gamma_coeff:
-        x = x + 1.0
-        ser = ser + torch.pow(x / c, -1)
-    return torch.log(ser * magic2) - t
-
-
-def log_beta(t):
+def copy_docs_from(source_class, full_text=False):
     """
-    Computes log Beta function.
-
-    :param t:
-    :type t: torch.autograd.Variable of dimension 1 or 2
-    :rtype: torch.autograd.Variable of float (if t.dim() == 1) or torch.Tensor (if t.dim() == 2)
+    Decorator to copy class and method docs from source to destin class.
     """
-    assert t.dim() in (1, 2)
-    if t.dim() == 1:
-        numer = torch.sum(log_gamma(t))
-        denom = log_gamma(torch.sum(t))
-    else:
-        numer = torch.sum(log_gamma(t), 1)
-        denom = log_gamma(torch.sum(t, 1))
-    return numer - denom
+
+    def decorator(destin_class):
+        # This works only in python 3.3+:
+        # if not destin_class.__doc__:
+        #     destin_class.__doc__ = source_class.__doc__
+        for name in dir(destin_class):
+            if name.startswith('_'):
+                continue
+            destin_attr = getattr(destin_class, name)
+            destin_attr = getattr(destin_attr, '__func__', destin_attr)
+            source_attr = getattr(source_class, name, None)
+            source_doc = getattr(source_attr, '__doc__', None)
+            if source_doc and not getattr(destin_attr, '__doc__', None):
+                if full_text or source_doc.startswith('See '):
+                    destin_doc = source_doc
+                else:
+                    destin_doc = 'See :meth:`{}.{}.{}`'.format(
+                        source_class.__module__, source_class.__name__, name)
+                if isinstance(destin_attr, property):
+                    # Set docs for object properties.
+                    # Since __doc__ is read-only, we need to reset the property
+                    # with the updated doc.
+                    updated_property = property(destin_attr.fget,
+                                                destin_attr.fset,
+                                                destin_attr.fdel,
+                                                destin_doc)
+                    setattr(destin_class, name, updated_property)
+                else:
+                    destin_attr.__doc__ = destin_doc
+        return destin_class
+
+    return decorator
 
 
-def move_to_same_host_as(source, destin):
+def is_identically_zero(x):
     """
-    Returns source or a copy of `source` such that `source.is_cuda == `destin.is_cuda`.
+    Check if argument is exactly the number zero. True for the number zero;
+    false for other numbers; false for :class:`~torch.Tensor`s.
     """
-    return source.cuda() if destin.is_cuda else source.cpu()
+    if isinstance(x, numbers.Number):
+        return x == 0
+    elif isinstance(x, torch.Tensor) and x.dtype == torch.int64 and not x.shape:
+        return x.item() == 0
+    return False
 
 
-def torch_zeros_like(x):
+def is_identically_one(x):
     """
-    Polyfill for `torch.zeros_like()`.
+    Check if argument is exactly the number one. True for the number one;
+    false for other numbers; false for :class:`~torch.Tensor`s.
     """
-    # Work around https://github.com/pytorch/pytorch/issues/2906
-    if isinstance(x, Variable):
-        return Variable(torch_zeros_like(x.data))
-    # Support Pytorch before https://github.com/pytorch/pytorch/pull/2489
+    if isinstance(x, numbers.Number):
+        return x == 1
+    elif isinstance(x, torch.Tensor) and x.dtype == torch.int64 and not x.shape:
+        return x.item() == 1
+    return False
+
+
+def broadcast_shape(*shapes, **kwargs):
+    """
+    Similar to ``np.broadcast()`` but for shapes.
+    Equivalent to ``np.broadcast(*map(np.empty, shapes)).shape``.
+
+    :param tuple shapes: shapes of tensors.
+    :param bool strict: whether to use extend-but-not-resize broadcasting.
+    :returns: broadcasted shape
+    :rtype: tuple
+    :raises: ValueError
+    """
+    strict = kwargs.pop('strict', False)
+    reversed_shape = []
+    for shape in shapes:
+        for i, size in enumerate(reversed(shape)):
+            if i >= len(reversed_shape):
+                reversed_shape.append(size)
+            elif reversed_shape[i] == 1 and not strict:
+                reversed_shape[i] = size
+            elif reversed_shape[i] != size and (size != 1 or strict):
+                raise ValueError('shape mismatch: objects cannot be broadcast to a single shape: {}'.format(
+                    ' vs '.join(map(str, shapes))))
+    return tuple(reversed(reversed_shape))
+
+
+def gather(value, index, dim):
+    """
+    Broadcasted gather of indexed values along a named dim.
+    """
+    value, index = broadcast_all(value, index)
+    with ignore_jit_warnings():
+        zero = torch.zeros(1, dtype=torch.long, device=index.device)
+    index = index.index_select(dim, zero)
+    return value.gather(dim, index)
+
+
+def sum_rightmost(value, dim):
+    """
+    Sum out ``dim`` many rightmost dimensions of a given tensor.
+
+    If ``dim`` is 0, no dimensions are summed out.
+    If ``dim`` is ``float('inf')``, then all dimensions are summed out.
+    If ``dim`` is 1, the rightmost 1 dimension is summed out.
+    If ``dim`` is 2, the rightmost two dimensions are summed out.
+    If ``dim`` is -1, all but the leftmost 1 dimension is summed out.
+    If ``dim`` is -2, all but the leftmost 2 dimensions are summed out.
+    etc.
+
+    :param torch.Tensor value: A tensor of ``.dim()`` at least ``dim``.
+    :param int dim: The number of rightmost dims to sum out.
+    """
+    if isinstance(value, numbers.Number):
+        return value
+    if dim < 0:
+        dim += value.dim()
+    if dim == 0:
+        return value
+    if dim >= value.dim():
+        return value.sum()
+    return value.reshape(value.shape[:-dim] + (-1,)).sum(-1)
+
+
+def sum_leftmost(value, dim):
+    """
+    Sum out ``dim`` many leftmost dimensions of a given tensor.
+
+    If ``dim`` is 0, no dimensions are summed out.
+    If ``dim`` is ``float('inf')``, then all dimensions are summed out.
+    If ``dim`` is 1, the leftmost 1 dimension is summed out.
+    If ``dim`` is 2, the leftmost two dimensions are summed out.
+    If ``dim`` is -1, all but the rightmost 1 dimension is summed out.
+    If ``dim`` is -2, all but the rightmost 2 dimensions are summed out.
+    etc.
+
+    Example::
+
+        x = torch.ones(2, 3, 4)
+        assert sum_leftmost(x, 1).shape == (3, 4)
+        assert sum_leftmost(x, -1).shape == (4,)
+
+    :param torch.Tensor value: A tensor
+    :param int dim: Specifies the number of dims to sum out
+    """
+    if isinstance(value, numbers.Number):
+        return value
+    if dim < 0:
+        dim += value.dim()
+    if dim == 0:
+        return value
+    if dim >= value.dim():
+        return value.sum()
+    return value.reshape(-1, *value.shape[dim:]).sum(0)
+
+
+def scale_and_mask(tensor, scale=1.0, mask=None):
+    """
+    Scale and mask a tensor, broadcasting and avoiding unnecessary ops.
+
+    :param tensor: an input tensor or zero
+    :type tensor: torch.Tensor or the number zero
+    :param scale: a positive scale
+    :type scale: torch.Tensor or number
+    :param mask: an optional masking tensor
+    :type mask: torch.ByteTensor or None
+    """
+    if not torch._C._get_tracing_state():
+        if is_identically_zero(tensor) or (mask is None and is_identically_one(scale)):
+            return tensor
+    if mask is None:
+        return tensor * scale
+    tensor, mask = broadcast_all(tensor, mask)
+    tensor = tensor * scale
+    tensor.masked_fill_(mask == 0, 0.)
+    return tensor
+
+
+def scalar_like(prototype, fill_value):
+    return torch.tensor(fill_value, dtype=prototype.dtype, device=prototype.device)
+
+
+# work around lack of jit support for torch.eye(..., out=value)
+def eye_like(value, m, n=None):
+    if n is None:
+        n = m
+    eye = torch.zeros(m, n, dtype=value.dtype, device=value.device)
+    eye.view(-1)[:min(m, n) * n:n + 1] = 1
+    return eye
+
+
+def enable_validation(is_validate):
+    global _VALIDATION_ENABLED
+    _VALIDATION_ENABLED = is_validate
+    torch_dist.Distribution.set_default_validate_args(is_validate)
+
+
+def is_validation_enabled():
+    return _VALIDATION_ENABLED
+
+
+@contextmanager
+def validation_enabled(is_validate=True):
+    distribution_validation_status = is_validation_enabled()
     try:
-        return torch.zeros_like(x)
-    except AttributeError:
-        return torch.zeros(x.size()).type_as(x)
-
-
-def torch_ones_like(x):
-    """
-    Polyfill for `torch.ones_like()`.
-    """
-    # Work around https://github.com/pytorch/pytorch/issues/2906
-    if isinstance(x, Variable):
-        return Variable(torch_ones_like(x.data))
-    # Support Pytorch before https://github.com/pytorch/pytorch/pull/2489
-    try:
-        return torch.ones_like(x)
-    except AttributeError:
-        return torch.ones(x.size()).type_as(x)
-
-
-def torch_eye(n, m=None, out=None):
-    """
-    Like `torch.eye()`, but works with cuda tensors.
-    """
-    if m is None:
-        m = n
-    try:
-        return torch.eye(n, m, out=out)
-    except TypeError:
-        # Only catch errors due to torch.eye() not being availble for cuda tensors.
-        module = torch.Tensor.__module__ if out is None else type(out).__module__
-        if module != 'torch.cuda':
-            raise
-    Tensor = getattr(torch, torch.Tensor.__name__)
-    cpu_out = Tensor(n, m)
-    cuda_out = torch.eye(m, n, out=cpu_out).cuda()
-    return cuda_out if out is None else out.copy_(cuda_out)
-
-
-def torch_multinomial(input, num_samples, replacement=False):
-    """
-    Like `torch.multinomial()` but works with cuda tensors.
-    Does not support keyword argument `out`.
-    """
-    if input.is_cuda:
-        return torch_multinomial(input.cpu(), num_samples, replacement).cuda()
-    else:
-        return torch.multinomial(input, num_samples, replacement)
-
-
-def softmax(x, dim=-1):
-    """
-    TODO: change to use the default pyTorch implementation when available
-    Source: https://discuss.pytorch.org/t/why-softmax-function-cant-specify-the-dimension-to-operate/2637
-    :param x: tensor
-    :param dim: Dimension to apply the softmax function to. The elements of the tensor in this
-        dimension must sum to 1.
-    :return: tensor having the same dimension as `x` rescaled along dim
-    """
-    input_size = x.size()
-
-    trans_input = x.transpose(dim, len(input_size) - 1)
-    trans_size = trans_input.size()
-
-    input_2d = trans_input.contiguous().view(-1, trans_size[-1])
-
-    try:
-        soft_max_2d = F.softmax(input_2d, 1)
-    except TypeError:
-        # Support older pytorch 0.2 release.
-        soft_max_2d = F.softmax(input_2d)
-
-    soft_max_nd = soft_max_2d.view(*trans_size)
-    return soft_max_nd.transpose(dim, len(input_size) - 1)
-
-
-def _get_clamping_buffer(tensor):
-    clamp_eps = 1e-6
-    if isinstance(tensor, Variable):
-        tensor = tensor.data
-    if isinstance(tensor, (torch.DoubleTensor, torch.cuda.DoubleTensor)):
-        clamp_eps = 1e-15
-    return clamp_eps
-
-
-def get_probs_and_logits(ps=None, logits=None, is_multidimensional=True):
-    """
-    Convert probability values to logits, or vice-versa. Either ``ps`` or
-    ``logits`` should be specified, but not both.
-
-    :param ps: tensor of probabilities. Should be in the interval *[0, 1]*.
-        If, ``is_multidimensional = True``, then must be normalized along
-        axis -1.
-    :param logits: tensor of logit values.  For the multidimensional case,
-        the values, when exponentiated along the last dimension, must sum
-        to 1.
-    :param is_multidimensional: determines the computation of ps from logits,
-        and vice-versa. For the multi-dimensional case, logit values are
-        assumed to be log probabilities, whereas for the uni-dimensional case,
-        it specifically refers to log odds.
-    :return: tuple containing raw probabilities and logits as tensors.
-    """
-    assert (ps is None) != (logits is None)
-    if ps is not None:
-        eps = _get_clamping_buffer(ps)
-        ps_clamped = ps.clamp(min=eps, max=1 - eps)
-    if is_multidimensional:
-        if ps is None:
-            ps = softmax(logits, -1)
-        else:
-            logits = torch.log(ps_clamped)
-    else:
-        if ps is None:
-            ps = F.sigmoid(logits)
-        else:
-            logits = torch.log(ps_clamped) - torch.log1p(-ps_clamped)
-    return ps, logits
+        enable_validation(is_validate)
+        yield
+    finally:
+        enable_validation(distribution_validation_status)

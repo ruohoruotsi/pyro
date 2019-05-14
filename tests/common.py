@@ -3,9 +3,9 @@ from __future__ import absolute_import, division, print_function
 import contextlib
 import numbers
 import os
-import unittest
+import shutil
+import tempfile
 import warnings
-from copy import deepcopy
 from itertools import product
 
 import numpy as np
@@ -14,11 +14,6 @@ import torch
 import torch.cuda
 from numpy.testing import assert_allclose
 from pytest import approx
-from torch.autograd import Variable
-
-import pyro.util
-
-torch.set_default_tensor_type(os.environ.get('PYRO_TENSOR_TYPE', 'torch.DoubleTensor'))
 
 """
 Contains test utilities for assertions, approximate comparison (of tensors and other objects).
@@ -32,6 +27,14 @@ RESOURCE_DIR = os.path.join(TESTS_DIR, 'resources')
 EXAMPLES_DIR = os.path.join(os.path.dirname(TESTS_DIR), 'examples')
 
 
+def xfail_param(*args, **kwargs):
+    return pytest.param(*args, marks=[pytest.mark.xfail(**kwargs)])
+
+
+def skipif_param(*args, **kwargs):
+    return pytest.param(*args, marks=[pytest.mark.skipif(**kwargs)])
+
+
 def suppress_warnings(fn):
     def wrapper(*args, **kwargs):
         with warnings.catch_warnings():
@@ -39,6 +42,17 @@ def suppress_warnings(fn):
             fn(*args, **kwargs)
 
     return wrapper
+
+
+# backport of Python 3's context manager
+@contextlib.contextmanager
+def TemporaryDirectory():
+    try:
+        path = tempfile.mkdtemp()
+        yield path
+    finally:
+        if os.path.exists(path):
+            shutil.rmtree(path)
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(),
@@ -55,35 +69,15 @@ def get_gpu_type(t):
     return getattr(torch.cuda, t.__name__)
 
 
-def to_gpu(obj, type_map={}):
-    if torch.is_tensor(obj):
-        t = type_map.get(type(obj), get_gpu_type(type(obj)))
-        return obj.clone().type(t)
-    elif torch.is_storage(obj):
-        return obj.new().resize_(obj.size()).copy_(obj)
-    elif isinstance(obj, Variable):
-        assert obj.is_leaf
-        t = type_map.get(type(obj.data), get_gpu_type(type(obj.data)))
-        return Variable(obj.data.clone().type(
-            t), requires_grad=obj.requires_grad)
-    elif isinstance(obj, list):
-        return [to_gpu(o, type_map) for o in obj]
-    elif isinstance(obj, tuple):
-        return tuple(to_gpu(o, type_map) for o in obj)
-    else:
-        return deepcopy(obj)
-
-
 @contextlib.contextmanager
 def tensors_default_to(host):
     """
-    Context manager to temporarily use Cpu or Cuda tensors in Pytorch.
+    Context manager to temporarily use Cpu or Cuda tensors in PyTorch.
 
     :param str host: Either "cuda" or "cpu".
     """
     assert host in ('cpu', 'cuda'), host
-    old_module = torch.Tensor.__module__
-    name = torch.Tensor.__name__
+    old_module, name = torch.Tensor().type().rsplit('.', 1)
     new_module = 'torch.cuda' if host == 'cuda' else 'torch'
     torch.set_default_tensor_type('{}.{}'.format(new_module, name))
     try:
@@ -127,32 +121,27 @@ def is_iterable(obj):
         return False
 
 
-def _unwrap_variables(x, y):
-    if isinstance(x, Variable) and isinstance(y, Variable):
-        return x.data, y.data
-    elif isinstance(x, Variable) or isinstance(y, Variable):
-        raise AssertionError(
-            "cannot compare {} and {}".format(
-                type(x), type(y)))
-    return x, y
-
-
-def assert_tensors_equal(a, b, prec=1e-5, msg=''):
+def assert_tensors_equal(a, b, prec=0., msg=''):
     assert a.size() == b.size(), msg
-    if prec == 0:
+    if isinstance(prec, numbers.Number) and prec == 0:
         assert (a == b).all(), msg
-    elif a.numel() > 0:
-        b = b.type_as(a)
-        b = b.cuda(device=a.get_device()) if a.is_cuda else b.cpu()
-        # check that NaNs are in the same locations
-        nan_mask = a != a
-        assert torch.equal(nan_mask, b != b), msg
-        diff = a - b
-        diff[nan_mask] = 0
-        if diff.is_signed():
-            diff = diff.abs()
-        max_err = diff.max()
-        assert max_err < prec, msg
+    if a.numel() == 0 and b.numel() == 0:
+        return
+    b = b.type_as(a)
+    b = b.cuda(device=a.get_device()) if a.is_cuda else b.cpu()
+    # check that NaNs are in the same locations
+    nan_mask = a != a
+    assert torch.equal(nan_mask, b != b), msg
+    diff = a - b
+    diff[a == b] = 0  # handle inf
+    diff[nan_mask] = 0
+    if diff.is_signed():
+        diff = diff.abs()
+    if isinstance(prec, torch.Tensor):
+        assert (diff <= prec).all(), msg
+    else:
+        max_err = diff.max().item()
+        assert (max_err <= prec), msg
 
 
 def _safe_coalesce(t):
@@ -167,82 +156,98 @@ def _safe_coalesce(t):
 
     new_indices = sorted(list(value_map.keys()))
     new_values = [value_map[idx] for idx in new_indices]
-    if t._values().ndimension() < 2:
-        new_values = t._values().new(new_values)
+    if t._values().dim() < 2:
+        new_values = t._values().new_tensor(new_values)
     else:
         new_values = torch.stack(new_values)
 
-    new_indices = t._indices().new(new_indices).t()
+    new_indices = t._indices().new_tensor(new_indices).t()
     tg = t.new(new_indices, new_values, t.size())
 
-    assert tc._indices() == tg._indices()
-    assert tc._values() == tg._values()
+    assert (tc._indices() == tg._indices()).all()
+    assert (tc._values() == tg._values()).all()
     return tg
 
 
-# TODO Split this into assert_equal() and assert_close() or assert_almost_equal().
-def assert_equal(x, y, prec=1e-5, msg=''):
-    x, y = _unwrap_variables(x, y)
-
-    if torch.is_tensor(x) and torch.is_tensor(y):
-        assert_equal(x.is_sparse, y.is_sparse, prec, msg)
-        if x.is_sparse:
-            x = _safe_coalesce(x)
-            y = _safe_coalesce(y)
+def assert_close(actual, expected, atol=1e-7, rtol=0, msg=''):
+    if not msg:
+        msg = '{} vs {}'.format(actual, expected)
+    if isinstance(actual, numbers.Number) and isinstance(expected, numbers.Number):
+        assert actual == approx(expected, abs=atol, rel=rtol), msg
+    # Placing this as a second check allows for coercing of numeric types above;
+    # this can be moved up to harden type checks.
+    elif type(actual) != type(expected):
+        raise AssertionError("cannot compare {} and {}".format(type(actual),
+                                                               type(expected)))
+    elif torch.is_tensor(actual) and torch.is_tensor(expected):
+        prec = atol + rtol * abs(expected) if rtol > 0 else atol
+        assert actual.is_sparse == expected.is_sparse, msg
+        if actual.is_sparse:
+            x = _safe_coalesce(actual)
+            y = _safe_coalesce(expected)
             assert_tensors_equal(x._indices(), y._indices(), prec, msg)
             assert_tensors_equal(x._values(), y._values(), prec, msg)
         else:
-            assert_tensors_equal(x, y, prec, msg)
-    elif type(x) == np.ndarray and type(y) == np.ndarray:
-        if prec == 0:
-            assert (x == y).all(), msg
-        else:
-            assert_allclose(x, y, atol=prec, equal_nan=True)
-    elif isinstance(x, numbers.Number) and isinstance(y, numbers.Number):
-        if prec == 0:
-            assert x == y, msg
-        else:
-            assert x == approx(y, abs=prec), msg
-    elif type(x) != type(y):
-        raise AssertionError("cannot compare {} and {}".format(type(x), type(y)))
-    elif isinstance(x, str):
-        assert x == y, msg
-    elif isinstance(x, dict):
-        assert set(x.keys()) == set(y.keys())
-        for key, x_val in x.items():
-            assert_equal(x_val, y[key], prec, msg='{} {}'.format(key, msg))
-    elif is_iterable(x) and is_iterable(y):
-        if prec == 0:
-            assert len(x) == len(y)
-            for xi, yi in zip(x, y):
-                assert_equal(xi, yi, prec, msg)
-        else:
-            assert list(x) == approx(list(y), prec), msg
+            assert_tensors_equal(actual, expected, prec, msg)
+    elif type(actual) == np.ndarray and type(expected) == np.ndarray:
+        assert_allclose(actual, expected, atol=atol, rtol=rtol, equal_nan=True, err_msg=msg)
+    elif isinstance(actual, numbers.Number) and isinstance(y, numbers.Number):
+        assert actual == approx(expected, abs=atol, rel=rtol), msg
+    elif isinstance(actual, dict):
+        assert set(actual.keys()) == set(expected.keys())
+        for key, x_val in actual.items():
+            assert_close(x_val, expected[key], atol=atol, rtol=rtol,
+                         msg='At key{}: {} vs {}'.format(key, x_val, expected[key]))
+    elif is_iterable(actual) and is_iterable(expected):
+        assert len(actual) == len(expected), msg
+        for xi, yi in zip(actual, expected):
+            assert_close(xi, yi, atol=atol, rtol=rtol, msg='{} vs {}'.format(xi, yi))
     else:
-        assert x == y, msg
+        assert actual == expected, msg
+
+
+# TODO: Remove `prec` arg, and move usages to assert_close
+def assert_equal(actual, expected, prec=1e-5, msg=''):
+    if prec > 0.:
+        return assert_close(actual, expected, atol=prec, msg=msg)
+    if not msg:
+        msg = '{} vs {}'.format(actual, expected)
+    if isinstance(actual, numbers.Number) and isinstance(expected, numbers.Number):
+        assert actual == expected, msg
+    # Placing this as a second check allows for coercing of numeric types above;
+    # this can be moved up to harden type checks.
+    elif type(actual) != type(expected):
+        raise AssertionError("cannot compare {} and {}".format(type(actual),
+                                                               type(expected)))
+    elif torch.is_tensor(actual) and torch.is_tensor(expected):
+        assert actual.is_sparse == expected.is_sparse, msg
+        if actual.is_sparse:
+            x = _safe_coalesce(actual)
+            y = _safe_coalesce(expected)
+            assert_tensors_equal(x._indices(), y._indices(), msg=msg)
+            assert_tensors_equal(x._values(), y._values(), msg=msg)
+        else:
+            assert_tensors_equal(actual, expected, msg=msg)
+    elif type(actual) == np.ndarray and type(actual) == np.ndarray:
+        assert (actual == expected).all(), msg
+    elif isinstance(actual, dict):
+        assert set(actual.keys()) == set(expected.keys())
+        for key, x_val in actual.items():
+            assert_equal(x_val, expected[key], prec=0.,
+                         msg='At key{}: {} vs {}'.format(key, x_val, expected[key]))
+    elif isinstance(actual, str):
+        assert actual == expected, msg
+    elif is_iterable(actual) and is_iterable(expected):
+        assert len(actual) == len(expected), msg
+        for xi, yi in zip(actual, expected):
+            assert_equal(xi, yi, prec=0., msg='{} vs {}'.format(xi, yi))
+    else:
+        assert actual == expected, msg
 
 
 def assert_not_equal(x, y, prec=1e-5, msg=''):
     try:
         assert_equal(x, y, prec)
     except AssertionError:
-        pass
+        return
     raise AssertionError("{} \nValues are equal: x={}, y={}, prec={}".format(msg, x, y, prec))
-
-
-# Avoid tests that fail due to https://github.com/uber/pyro/issues/377
-torch_version = pyro.util.parse_torch_version()
-segfaults_on_pytorch_020 = pytest.mark.skipif(
-    torch_version < (0, 2, 1) and not torch_version[-1].startswith("+"),
-    reason=("pytorch segfaults at 0.2.0_4, fixed by 0.2.0+f964105. "
-            "See https://github.com/uber/pyro/issues/377"))
-
-
-class TestCase(unittest.TestCase):
-    precision = 1e-5
-
-    def assertEqual(self, x, y, prec=None, message=''):
-        assert_equal(x, y, prec, message)
-
-    def assertNotEqual(self, x, y, prec=None, message=''):
-        assert_not_equal(x, y, prec, message)

@@ -1,25 +1,178 @@
 from __future__ import absolute_import, division, print_function
 
-import warnings
+import weakref
+from operator import itemgetter
 
-import networkx
 import torch
 
 import pyro
-import pyro.poutine as poutine
-from pyro.infer.util import torch_backward, torch_data_sum
-from pyro.poutine.util import prune_subsample_sites
-from pyro.util import check_model_guide_match, detach_iterable, ng_zeros
+import pyro.ops.jit
+from pyro.distributions.util import is_identically_zero
+from pyro.infer import ELBO
+from pyro.infer.enum import get_importance_trace
+from pyro.infer.util import (MultiFrameTensor, detach_iterable, get_plate_stacks,
+                             is_validation_enabled, torch_backward, torch_item)
+from pyro.util import check_if_enumerated, warn_if_nan
 
 
-class TraceGraph_ELBO(object):
+def _get_baseline_options(site):
+    """
+    Extracts baseline options from ``site["infer"]["baseline"]``.
+    """
+    # XXX default for baseline_beta currently set here
+    options_dict = site["infer"].get("baseline", {}).copy()
+    options_tuple = (options_dict.pop('nn_baseline', None),
+                     options_dict.pop('nn_baseline_input', None),
+                     options_dict.pop('use_decaying_avg_baseline', False),
+                     options_dict.pop('baseline_beta', 0.90),
+                     options_dict.pop('baseline_value', None))
+    if options_dict:
+        raise ValueError("Unrecognized baseline options: {}".format(options_dict.keys()))
+    return options_tuple
+
+
+def _compute_downstream_costs(model_trace, guide_trace,  #
+                              non_reparam_nodes):
+    # recursively compute downstream cost nodes for all sample sites in model and guide
+    # (even though ultimately just need for non-reparameterizable sample sites)
+    # 1. downstream costs used for rao-blackwellization
+    # 2. model observe sites (as well as terms that arise from the model and guide having different
+    # dependency structures) are taken care of via 'children_in_model' below
+    topo_sort_guide_nodes = guide_trace.topological_sort(reverse=True)
+    topo_sort_guide_nodes = [x for x in topo_sort_guide_nodes
+                             if guide_trace.nodes[x]["type"] == "sample"]
+    ordered_guide_nodes_dict = {n: i for i, n in enumerate(topo_sort_guide_nodes)}
+
+    downstream_guide_cost_nodes = {}
+    downstream_costs = {}
+    stacks = get_plate_stacks(model_trace)
+
+    for node in topo_sort_guide_nodes:
+        downstream_costs[node] = MultiFrameTensor((stacks[node],
+                                                   model_trace.nodes[node]['log_prob'] -
+                                                   guide_trace.nodes[node]['log_prob']))
+        nodes_included_in_sum = set([node])
+        downstream_guide_cost_nodes[node] = set([node])
+        # make more efficient by ordering children appropriately (higher children first)
+        children = [(k, -ordered_guide_nodes_dict[k]) for k in guide_trace.successors(node)]
+        sorted_children = sorted(children, key=itemgetter(1))
+        for child, _ in sorted_children:
+            child_cost_nodes = downstream_guide_cost_nodes[child]
+            downstream_guide_cost_nodes[node].update(child_cost_nodes)
+            if nodes_included_in_sum.isdisjoint(child_cost_nodes):  # avoid duplicates
+                downstream_costs[node].add(*downstream_costs[child].items())
+                # XXX nodes_included_in_sum logic could be more fine-grained, possibly leading
+                # to speed-ups in case there are many duplicates
+                nodes_included_in_sum.update(child_cost_nodes)
+        missing_downstream_costs = downstream_guide_cost_nodes[node] - nodes_included_in_sum
+        # include terms we missed because we had to avoid duplicates
+        for missing_node in missing_downstream_costs:
+            downstream_costs[node].add((stacks[missing_node],
+                                        model_trace.nodes[missing_node]['log_prob'] -
+                                        guide_trace.nodes[missing_node]['log_prob']))
+
+    # finish assembling complete downstream costs
+    # (the above computation may be missing terms from model)
+    for site in non_reparam_nodes:
+        children_in_model = set()
+        for node in downstream_guide_cost_nodes[site]:
+            children_in_model.update(model_trace.successors(node))
+        # remove terms accounted for above
+        children_in_model.difference_update(downstream_guide_cost_nodes[site])
+        for child in children_in_model:
+            assert (model_trace.nodes[child]["type"] == "sample")
+            downstream_costs[site].add((stacks[child],
+                                        model_trace.nodes[child]['log_prob']))
+            downstream_guide_cost_nodes[site].update([child])
+
+    for k in non_reparam_nodes:
+        downstream_costs[k] = downstream_costs[k].sum_to(guide_trace.nodes[k]["cond_indep_stack"])
+
+    return downstream_costs, downstream_guide_cost_nodes
+
+
+def _compute_elbo_reparam(model_trace, guide_trace, non_reparam_nodes):
+    elbo = 0.0
+    surrogate_elbo = 0.0
+
+    # deal with log p(z|...) terms
+    for name, site in model_trace.nodes.items():
+        if site["type"] == "sample":
+            elbo += site["log_prob_sum"]
+            surrogate_elbo += site["log_prob_sum"]
+
+    # deal with log q(z|...) terms
+    for name, site in guide_trace.nodes.items():
+        if site["type"] == "sample":
+            elbo -= site["log_prob_sum"]
+            entropy_term = site["score_parts"].entropy_term
+            if not is_identically_zero(entropy_term):
+                surrogate_elbo -= entropy_term.sum()
+
+    return elbo, surrogate_elbo
+
+
+def _compute_elbo_non_reparam(guide_trace, non_reparam_nodes, downstream_costs):
+    # construct all the reinforce-like terms.
+    # we include only downstream costs to reduce variance
+    # optionally include baselines to further reduce variance
+    # XXX should the average baseline be in the param store as below?
+    surrogate_elbo = 0.0
+    baseline_loss = 0.0
+    for node in non_reparam_nodes:
+        guide_site = guide_trace.nodes[node]
+        downstream_cost = downstream_costs[node]
+        baseline = 0.0
+        (nn_baseline, nn_baseline_input, use_decaying_avg_baseline, baseline_beta,
+            baseline_value) = _get_baseline_options(guide_site)
+        use_nn_baseline = nn_baseline is not None
+        use_baseline_value = baseline_value is not None
+        assert(not (use_nn_baseline and use_baseline_value)), \
+            "cannot use baseline_value and nn_baseline simultaneously"
+        if use_decaying_avg_baseline:
+            dc_shape = downstream_cost.shape
+            param_name = "__baseline_avg_downstream_cost_" + node
+            with torch.no_grad():
+                avg_downstream_cost_old = pyro.param(param_name,
+                                                     torch.zeros(dc_shape, device=guide_site['value'].device))
+                avg_downstream_cost_new = (1 - baseline_beta) * downstream_cost + \
+                    baseline_beta * avg_downstream_cost_old
+            pyro.get_param_store()[param_name] = avg_downstream_cost_new
+            baseline += avg_downstream_cost_old
+        if use_nn_baseline:
+            # block nn_baseline_input gradients except in baseline loss
+            baseline += nn_baseline(detach_iterable(nn_baseline_input))
+        elif use_baseline_value:
+            # it's on the user to make sure baseline_value tape only points to baseline params
+            baseline += baseline_value
+        if use_nn_baseline or use_baseline_value:
+            # accumulate baseline loss
+            baseline_loss += torch.pow(downstream_cost.detach() - baseline, 2.0).sum()
+
+        score_function_term = guide_site["score_parts"].score_function
+        if use_nn_baseline or use_decaying_avg_baseline or use_baseline_value:
+            if downstream_cost.shape != baseline.shape:
+                raise ValueError("Expected baseline at site {} to be {} instead got {}".format(
+                    node, downstream_cost.shape, baseline.shape))
+            downstream_cost = downstream_cost - baseline
+        surrogate_elbo += (score_function_term * downstream_cost.detach()).sum()
+
+    return surrogate_elbo, baseline_loss
+
+
+class TraceGraph_ELBO(ELBO):
     """
     A TraceGraph implementation of ELBO-based SVI. The gradient estimator
     is constructed along the lines of reference [1] specialized to the case
     of the ELBO. It supports arbitrary dependency structure for the model
-    and guide as well as baselines for non-reparameteriable random variables.
-    Where possible, dependency information as recorded in the TraceGraph is
-    used to reduce the variance of the gradient estimator.
+    and guide as well as baselines for non-reparameterizable random variables.
+    Where possible, conditional dependency information as recorded in the
+    :class:`~pyro.poutine.trace.Trace` is used to reduce the variance of the gradient estimator.
+    In particular two kinds of conditional dependency information are
+    used to reduce variance:
+
+    - the sequential order of samples (z is sampled after y => y does not depend on z)
+    - :class:`~pyro.plate` generators
 
     References
 
@@ -29,38 +182,17 @@ class TraceGraph_ELBO(object):
     [2] `Neural Variational Inference and Learning in Belief Networks`
         Andriy Mnih, Karol Gregor
     """
-    def __init__(self, num_particles=1, enum_discrete=False):
+
+    def _get_trace(self, model, guide, *args, **kwargs):
         """
-        :param num_particles: the number of particles (samples) used to form the estimator
-        :param bool enum_discrete: whether to sum over discrete latent variables, rather than sample them
+        Returns a single trace from the guide, and the model that is run
+        against it.
         """
-        super(TraceGraph_ELBO, self).__init__()
-        self.num_particles = num_particles
-        self.enum_discrete = enum_discrete
-
-    def _get_traces(self, model, guide, *args, **kwargs):
-        """
-        runs the guide and runs the model against the guide with
-        the result packaged as a tracegraph generator
-
-        XXX support for automatically settings args/kwargs to volatile?
-        """
-
-        for i in range(self.num_particles):
-            if self.enum_discrete:
-                raise NotImplementedError("https://github.com/uber/pyro/issues/220")
-
-            guide_trace = poutine.trace(guide,
-                                        graph_type="dense").get_trace(*args, **kwargs)
-            model_trace = poutine.trace(poutine.replay(model, guide_trace),
-                                        graph_type="dense").get_trace(*args, **kwargs)
-
-            check_model_guide_match(model_trace, guide_trace)
-            guide_trace = prune_subsample_sites(guide_trace)
-            model_trace = prune_subsample_sites(model_trace)
-
-            weight = 1.0 / self.num_particles
-            yield weight, model_trace, guide_trace
+        model_trace, guide_trace = get_importance_trace(
+            "dense", self.max_plate_nesting, model, guide, *args, **kwargs)
+        if is_validation_enabled():
+            check_if_enumerated(guide_trace)
+        return model_trace, guide_trace
 
     def loss(self, model, guide, *args, **kwargs):
         """
@@ -70,22 +202,12 @@ class TraceGraph_ELBO(object):
         Evaluates the ELBO with an estimator that uses num_particles many samples/particles.
         """
         elbo = 0.0
-        for weight, model_trace, guide_trace in self._get_traces(model, guide, *args, **kwargs):
-            guide_trace.log_pdf(), model_trace.log_pdf()
-
-            elbo_particle = 0.0
-
-            for name in model_trace.nodes.keys():
-                if model_trace.nodes[name]["type"] == "sample":
-                    if model_trace.nodes[name]["is_observed"]:
-                        elbo_particle += model_trace.nodes[name]["log_pdf"]
-                    else:
-                        elbo_particle += model_trace.nodes[name]["log_pdf"]
-                        elbo_particle -= guide_trace.nodes[name]["log_pdf"]
-
-            elbo += weight * elbo_particle.data[0]
+        for model_trace, guide_trace in self._get_traces(model, guide, *args, **kwargs):
+            elbo_particle = torch_item(model_trace.log_prob_sum()) - torch_item(guide_trace.log_prob_sum())
+            elbo += elbo_particle / float(self.num_particles)
 
         loss = -elbo
+        warn_if_nan(loss, "loss")
         return loss
 
     def loss_and_grads(self, model, guide, *args, **kwargs):
@@ -97,206 +219,94 @@ class TraceGraph_ELBO(object):
         Performs backward on the latter. Num_particle many samples are used to form the estimators.
         If baselines are present, a baseline loss is also constructed and differentiated.
         """
-        elbo = 0.0
-        trainable_params = set()
+        loss = 0.0
+        weight = 1./self.num_particles
+        for model_trace, guide_trace in self._get_traces(model, guide, *args, **kwargs):
+            loss += self._loss_and_grads_particle(weight, model_trace, guide_trace)
+        return loss
 
-        for weight, model_trace, guide_trace in self._get_traces(model, guide, *args, **kwargs):
+    def _loss_and_grads_particle(self, weight, model_trace, guide_trace):
+        # compute elbo for reparameterized nodes
+        non_reparam_nodes = set(guide_trace.nonreparam_stochastic_nodes)
+        elbo, surrogate_elbo = _compute_elbo_reparam(model_trace, guide_trace, non_reparam_nodes)
 
-            # get info regarding rao-blackwellization of vectorized map_data
-            guide_vec_md_info = guide_trace.graph["vectorized_map_data_info"]
-            model_vec_md_info = model_trace.graph["vectorized_map_data_info"]
-            guide_vec_md_condition = guide_vec_md_info['rao-blackwellization-condition']
-            model_vec_md_condition = model_vec_md_info['rao-blackwellization-condition']
-            do_vec_rb = guide_vec_md_condition and model_vec_md_condition
-            if not do_vec_rb:
-                warnings.warn(
-                    "Unable to do fully-vectorized Rao-Blackwellization in TraceGraph_ELBO. "
-                    "Falling back to higher-variance gradient estimator. "
-                    "Try to avoid these issues in your model and guide:\n{}".format("\n".join(
-                        guide_vec_md_info["warnings"] | model_vec_md_info["warnings"])))
-            guide_vec_md_nodes = guide_vec_md_info['nodes'] if do_vec_rb else set()
-            model_vec_md_nodes = model_vec_md_info['nodes'] if do_vec_rb else set()
+        # the following computations are only necessary if we have non-reparameterizable nodes
+        baseline_loss = 0.0
+        if non_reparam_nodes:
+            downstream_costs, _ = _compute_downstream_costs(model_trace, guide_trace, non_reparam_nodes)
+            surrogate_elbo_term, baseline_loss = _compute_elbo_non_reparam(guide_trace,
+                                                                           non_reparam_nodes, downstream_costs)
+            surrogate_elbo += surrogate_elbo_term
 
-            # have the trace compute all the individual (batch) log pdf terms
-            # so that they are available below
-            guide_trace.compute_batch_log_pdf(site_filter=lambda name, site: name in guide_vec_md_nodes)
-            guide_trace.log_pdf()
-            model_trace.compute_batch_log_pdf(site_filter=lambda name, site: name in model_vec_md_nodes)
-            model_trace.log_pdf()
+        # collect parameters to train from model and guide
+        trainable_params = any(site["type"] == "param"
+                               for trace in (model_trace, guide_trace)
+                               for site in trace.nodes.values())
 
-            # prepare a list of all the cost nodes, each of which is +- log_pdf
-            cost_nodes = []
-            non_reparam_nodes = set(guide_trace.nonreparam_stochastic_nodes)
-            for site in model_trace.nodes.keys():
-                model_trace_site = model_trace.nodes[site]
-                log_pdf_key = 'batch_log_pdf' if site in model_vec_md_nodes else 'log_pdf'
-                if model_trace_site["type"] == "sample":
-                    if model_trace_site["is_observed"]:
-                        cost_node = (model_trace_site[log_pdf_key], True)
-                        cost_nodes.append(cost_node)
-                    else:
-                        # cost node from model sample
-                        cost_node1 = (model_trace_site[log_pdf_key], True)
-                        # cost node from guide sample
-                        zero_expectation = site in non_reparam_nodes
-                        cost_node2 = (-guide_trace.nodes[site][log_pdf_key],
-                                      not zero_expectation)
-                        cost_nodes.extend([cost_node1, cost_node2])
+        if trainable_params:
+            surrogate_loss = -surrogate_elbo
+            torch_backward(weight * (surrogate_loss + baseline_loss), retain_graph=self.retain_graph)
 
-            elbo_particle = 0.0
-            surrogate_elbo_particle = 0.0
-            baseline_loss_particle = 0.0
-            elbo_reinforce_terms_particle = 0.0
-            elbo_no_zero_expectation_terms_particle = 0.0
+        loss = -torch_item(elbo)
+        warn_if_nan(loss, "loss")
+        return weight * loss
 
-            # compute the elbo; if all stochastic nodes are reparameterizable, we're done
-            # this bit is never differentiated: it's here for getting an estimate of the elbo itself
-            for cost_node in cost_nodes:
-                elbo_particle += cost_node[0].sum()
-            elbo += weight * torch_data_sum(elbo_particle)
 
-            # compute the elbo, removing terms whose gradient is zero
-            # this is the bit that's actually differentiated
-            # XXX should the user be able to control if these terms are included?
-            for cost_node in cost_nodes:
-                if cost_node[1]:
-                    elbo_no_zero_expectation_terms_particle += cost_node[0].sum()
-            surrogate_elbo_particle += weight * elbo_no_zero_expectation_terms_particle
+class JitTraceGraph_ELBO(TraceGraph_ELBO):
+    """
+    Like :class:`TraceGraph_ELBO` but uses :func:`torch.jit.trace` to
+    compile :meth:`loss_and_grads`.
 
-            # the following computations are only necessary if we have non-reparameterizable nodes
-            if len(non_reparam_nodes) > 0:
+    This works only for a limited set of models:
 
-                # recursively compute downstream cost nodes for all sample sites in model and guide
-                # (even though ultimately just need for non-reparameterizable sample sites)
-                # 1. downstream costs used for rao-blackwellization
-                # 2. model observe sites (as well as terms that arise from the model and guide having different
-                # dependency structures) are taken care of via 'children_in_model' below
-                topo_sort_guide_nodes = list(reversed(list(networkx.topological_sort(guide_trace))))
-                topo_sort_guide_nodes = [x for x in topo_sort_guide_nodes
-                                         if guide_trace.nodes[x]["type"] == "sample"]
-                downstream_guide_cost_nodes = {}
-                downstream_costs = {}
+    -   Models must have static structure.
+    -   Models must not depend on any global data (except the param store).
+    -   All model inputs that are tensors must be passed in via ``*args``.
+    -   All model inputs that are *not* tensors must be passed in via
+        ``**kwargs``, and compilation will be triggered once per unique
+        ``**kwargs``.
+    """
 
-                for node in topo_sort_guide_nodes:
-                    node_log_pdf_key = 'batch_log_pdf' if node in guide_vec_md_nodes else 'log_pdf'
-                    downstream_costs[node] = model_trace.nodes[node][node_log_pdf_key] - \
-                        guide_trace.nodes[node][node_log_pdf_key]
-                    nodes_included_in_sum = set([node])
-                    downstream_guide_cost_nodes[node] = set([node])
-                    for child in guide_trace.successors(node):
-                        child_cost_nodes = downstream_guide_cost_nodes[child]
-                        downstream_guide_cost_nodes[node].update(child_cost_nodes)
-                        if nodes_included_in_sum.isdisjoint(child_cost_nodes):  # avoid duplicates
-                            if node_log_pdf_key == 'log_pdf':
-                                downstream_costs[node] += downstream_costs[child].sum()
-                            else:
-                                downstream_costs[node] += downstream_costs[child]
-                            nodes_included_in_sum.update(child_cost_nodes)
-                    missing_downstream_costs = downstream_guide_cost_nodes[node] - nodes_included_in_sum
-                    # include terms we missed because we had to avoid duplicates
-                    for missing_node in missing_downstream_costs:
-                        mn_log_pdf_key = 'batch_log_pdf' if missing_node in guide_vec_md_nodes else 'log_pdf'
-                        if node_log_pdf_key == 'log_pdf':
-                            downstream_costs[node] += (model_trace.nodes[missing_node][mn_log_pdf_key] -
-                                                       guide_trace.nodes[missing_node][mn_log_pdf_key]).sum()
-                        else:
-                            downstream_costs[node] += model_trace.nodes[missing_node][mn_log_pdf_key] - \
-                                                      guide_trace.nodes[missing_node][mn_log_pdf_key]
+    def loss_and_grads(self, model, guide, *args, **kwargs):
+        kwargs['_pyro_model_id'] = id(model)
+        kwargs['_pyro_guide_id'] = id(guide)
+        if getattr(self, '_loss_and_surrogate_loss', None) is None:
+            # build a closure for loss_and_surrogate_loss
+            weakself = weakref.ref(self)
 
-                # finish assembling complete downstream costs
-                # (the above computation may be missing terms from model)
-                # XXX can we cache some of the sums over children_in_model to make things more efficient?
-                for site in non_reparam_nodes:
-                    children_in_model = set()
-                    for node in downstream_guide_cost_nodes[site]:
-                        children_in_model.update(model_trace.successors(node))
-                    # remove terms accounted for above
-                    children_in_model.difference_update(downstream_guide_cost_nodes[site])
-                    for child in children_in_model:
-                        child_log_pdf_key = 'batch_log_pdf' if child in model_vec_md_nodes else 'log_pdf'
-                        site_log_pdf_key = 'batch_log_pdf' if site in guide_vec_md_nodes else 'log_pdf'
-                        assert (model_trace.nodes[child]["type"] == "sample")
-                        if site_log_pdf_key == 'log_pdf':
-                            downstream_costs[site] += model_trace.nodes[child][child_log_pdf_key].sum()
-                        else:
-                            downstream_costs[site] += model_trace.nodes[child][child_log_pdf_key]
+            @pyro.ops.jit.trace(ignore_warnings=self.ignore_jit_warnings,
+                                jit_options=self.jit_options)
+            def loss_and_surrogate_loss(*args, **kwargs):
+                kwargs.pop('_pyro_model_id')
+                kwargs.pop('_pyro_guide_id')
+                self = weakself()
+                loss = 0.0
+                surrogate_loss = 0.0
+                weight = 1.0 / self.num_particles
+                for model_trace, guide_trace in self._get_traces(model, guide, *args, **kwargs):
+                    # compute elbo for reparameterized nodes
+                    non_reparam_nodes = set(guide_trace.nonreparam_stochastic_nodes)
+                    elbo, surrogate_elbo = _compute_elbo_reparam(model_trace, guide_trace, non_reparam_nodes)
 
-                # construct all the reinforce-like terms.
-                # we include only downstream costs to reduce variance
-                # optionally include baselines to further reduce variance
-                # XXX should the average baseline be in the param store as below?
+                    # the following computations are only necessary if we have non-reparameterizable nodes
+                    baseline_loss = 0.0
+                    if non_reparam_nodes:
+                        downstream_costs, _ = _compute_downstream_costs(model_trace, guide_trace, non_reparam_nodes)
+                        surrogate_elbo_term, baseline_loss = _compute_elbo_non_reparam(guide_trace,
+                                                                                       non_reparam_nodes,
+                                                                                       downstream_costs)
+                        surrogate_elbo += surrogate_elbo_term
 
-                # for extracting baseline options from site["baseline"]
-                # XXX default for baseline_beta currently set here
-                def get_baseline_options(site_baseline):
-                    options_dict = site_baseline.copy()
-                    options_tuple = (options_dict.pop('nn_baseline', None),
-                                     options_dict.pop('nn_baseline_input', None),
-                                     options_dict.pop('use_decaying_avg_baseline', False),
-                                     options_dict.pop('baseline_beta', 0.90),
-                                     options_dict.pop('baseline_value', None))
-                    if options_dict:
-                        raise ValueError("Unrecognized baseline options: {}".format(options_dict.keys()))
-                    return options_tuple
+                    loss = loss - weight * elbo
+                    surrogate_loss = surrogate_loss - weight * surrogate_elbo
 
-                baseline_loss_particle = 0.0
-                for node in non_reparam_nodes:
-                    log_pdf_key = 'batch_log_pdf' if node in guide_vec_md_nodes else 'log_pdf'
-                    downstream_cost = downstream_costs[node]
-                    baseline = 0.0
-                    (nn_baseline, nn_baseline_input, use_decaying_avg_baseline, baseline_beta,
-                        baseline_value) = get_baseline_options(guide_trace.nodes[node]["baseline"])
-                    use_nn_baseline = nn_baseline is not None
-                    use_baseline_value = baseline_value is not None
-                    assert(not (use_nn_baseline and use_baseline_value)), \
-                        "cannot use baseline_value and nn_baseline simultaneously"
-                    if use_decaying_avg_baseline:
-                        avg_downstream_cost_old = pyro.param("__baseline_avg_downstream_cost_" + node,
-                                                             ng_zeros(1), tags="__tracegraph_elbo_internal_tag")
-                        avg_downstream_cost_new = (1 - baseline_beta) * downstream_cost + \
-                            baseline_beta * avg_downstream_cost_old
-                        avg_downstream_cost_old.data = avg_downstream_cost_new.data  # XXX copy_() ?
-                        baseline += avg_downstream_cost_old
-                    if use_nn_baseline:
-                        # block nn_baseline_input gradients except in baseline loss
-                        baseline += nn_baseline(detach_iterable(nn_baseline_input))
-                    elif use_baseline_value:
-                        # it's on the user to make sure baseline_value tape only points to baseline params
-                        baseline += baseline_value
-                    if use_nn_baseline or use_baseline_value:
-                        # construct baseline loss
-                        baseline_loss = torch.pow(downstream_cost.detach() - baseline, 2.0).sum()
-                        baseline_loss_particle += weight * baseline_loss
-                    if use_nn_baseline or use_decaying_avg_baseline or use_baseline_value:
-                        if downstream_cost.size() != baseline.size():
-                            raise ValueError("Expected baseline at site {} to be {} instead got {}".format(
-                                node, downstream_cost.size(), baseline.size()))
-                        elbo_reinforce_terms_particle += (guide_trace.nodes[node][log_pdf_key] *
-                                                          (downstream_cost - baseline).detach()).sum()
-                    else:
-                        elbo_reinforce_terms_particle += (guide_trace.nodes[node][log_pdf_key] *
-                                                          downstream_cost.detach()).sum()
+                return loss, surrogate_loss
 
-                surrogate_elbo_particle += weight * elbo_reinforce_terms_particle
-                torch_backward(baseline_loss_particle)
+            self._loss_and_surrogate_loss = loss_and_surrogate_loss
 
-            # grab model parameters to train
-            for name in model_trace.nodes.keys():
-                if model_trace.nodes[name]["type"] == "param":
-                    trainable_params.add(model_trace.nodes[name]["value"])
+        loss, surrogate_loss = self._loss_and_surrogate_loss(*args, **kwargs)
+        surrogate_loss.backward()
+        loss = loss.item()
 
-            # grab guide parameters to train
-            for name in guide_trace.nodes.keys():
-                if guide_trace.nodes[name]["type"] == "param":
-                    trainable_params.add(guide_trace.nodes[name]["value"])
-
-            # mark all params seen in trace as active so that gradient steps are taken downstream
-            pyro.get_param_store().mark_params_active(trainable_params)
-
-            surrogate_loss_particle = -surrogate_elbo_particle
-            if trainable_params:
-                torch_backward(surrogate_loss_particle)
-
-        loss = -elbo
-
+        warn_if_nan(loss, "loss")
         return loss
